@@ -1,0 +1,17 @@
+model: microsoft/deberta-v3-base
+task: cola
+output_root: outputs
+seed: 42
+learning_rate: 0.0001
+batch_size: 32
+eval_batch_size: 64
+gradient_accumulation_steps: 1
+weight_decay: 0.01
+warmup_ratio: 0.1
+max_seq_length: 128
+rank: 8
+alpha: 8
+dropout: 0.1
+switch_ratio: 0.5
+target_modules: query_proj,key_proj,value_proj
+modules_to_save: classifier,pooler

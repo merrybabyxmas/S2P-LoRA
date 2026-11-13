@@ -1,0 +1,8 @@
+{"instruction":"Return the next integer after 1.","output":"2"}
+{"instruction":"Return the next integer after 2.","output":"3"}
+{"instruction":"Return the next integer after 3.","output":"4"}
+{"instruction":"Return the next integer after 4.","output":"5"}
+{"instruction":"Return the previous integer before 2.","output":"1"}
+{"instruction":"Return the previous integer before 3.","output":"2"}
+{"instruction":"Return the previous integer before 4.","output":"3"}
+{"instruction":"Return the previous integer before 5.","output":"4"}
