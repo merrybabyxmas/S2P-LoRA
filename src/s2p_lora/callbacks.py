@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 from transformers import TrainerCallback
@@ -21,11 +22,13 @@ class BestAdapterCallback(TrainerCallback):
         *,
         greater_is_better: bool = True,
         require_parallel: bool = True,
+        adapter_metadata: dict[str, object] | None = None,
     ) -> None:
         self.output_dir = Path(output_dir)
         self.metric_name = metric_name if metric_name.startswith("eval_") else f"eval_{metric_name}"
         self.greater_is_better = greater_is_better
         self.require_parallel = require_parallel
+        self.adapter_metadata = dict(adapter_metadata or {})
         self.best_value: float | None = None
         self.best_step: int | None = None
 
@@ -38,7 +41,7 @@ class BestAdapterCallback(TrainerCallback):
 
     def on_evaluate(self, args, state, control, metrics=None, model=None, **kwargs):
         metrics = metrics or {}
-        if model is None or self.metric_name not in metrics:
+        if not state.is_world_process_zero or model is None or self.metric_name not in metrics:
             return control
         if self.require_parallel and any(
             module.mode != "parallel"
@@ -47,19 +50,21 @@ class BestAdapterCallback(TrainerCallback):
         ):
             return control
         value = float(metrics[self.metric_name])
-        if not self._improved(value):
+        if not math.isfinite(value) or not self._improved(value):
             return control
 
-        self.best_value = value
-        self.best_step = int(state.global_step)
+        step = int(state.global_step)
         metadata = {
+            **self.adapter_metadata,
             "selection": "best_validation_checkpoint",
             "metric": self.metric_name,
             "value": value,
-            "global_step": self.best_step,
+            "global_step": step,
         }
         save_adapter(model, self.output_dir / "best_adapter.pt", metadata=metadata)
         write_json(self.output_dir / "best_metric.json", metadata)
+        self.best_value = value
+        self.best_step = step
         return control
 
     def summary(self) -> dict[str, object]:

@@ -1,11 +1,14 @@
 """Integration tests for the HuggingFace Trainer switch lifecycle."""
 
+from copy import deepcopy
+
 import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import Dataset
 from transformers import TrainingArguments
+from transformers.utils.import_utils import check_torch_load_is_safe
 
 from s2p_lora.layer import S2PLoraLinear
 from s2p_lora.trainer import S2PLoraTrainer
@@ -106,3 +109,47 @@ def test_trainer_requires_an_actual_sequential_to_parallel_switch(tmp_path, swit
             train_dataset=TinyDataset(),
             switch_ratio=switch_ratio,
         )
+
+
+def test_evaluation_does_not_switch_and_single_step_schedule_rejects(tmp_path):
+    args = _training_args(tmp_path)
+    args.max_steps = 1
+    model = TinyS2PModel()
+    ds = TinyDataset()
+    trainer = S2PLoraTrainer(model=model, args=args, train_dataset=ds, eval_dataset=ds)
+    trainer.evaluate()
+    assert model.s2p.mode == "sequential"
+    with pytest.raises(ValueError, match="at least one training step"):
+        trainer.train()
+    assert model.s2p.mode == "sequential"
+
+
+def test_resume_on_either_side_of_rectangular_switch(tmp_path):
+    try:
+        check_torch_load_is_safe()
+    except ValueError as error:
+        pytest.skip(str(error))
+
+    torch.manual_seed(7)
+    base = TinyS2PModel()
+    dataset = TinyDataset()
+
+    def make_trainer(output):
+        args = _training_args(output)
+        args.max_steps = 4
+        args.gradient_accumulation_steps = 2
+        args.save_strategy = "steps"
+        args.save_steps = 1
+        return S2PLoraTrainer(model=deepcopy(base), args=args, train_dataset=dataset)
+
+    baseline = make_trainer(tmp_path / "baseline")
+    baseline.train()
+    assert baseline.switch_events == [{"step": 2, "progress": 0.5, "layers": 1}]
+    for step in (2, 3):
+        resumed = make_trainer(tmp_path / f"resume-{step}")
+        resumed.train(resume_from_checkpoint=str(tmp_path / "baseline" / f"checkpoint-{step}"))
+        assert resumed.switch_events == baseline.switch_events
+        assert resumed.state.global_step == baseline.state.global_step
+        assert resumed.lr_scheduler.state_dict() == baseline.lr_scheduler.state_dict()
+        for key, value in baseline.model.state_dict().items():
+            torch.testing.assert_close(resumed.model.state_dict()[key], value, rtol=0, atol=0)

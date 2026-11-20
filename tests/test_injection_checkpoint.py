@@ -1,5 +1,6 @@
 """Tests for model injection, compact checkpoints, and adapter merging."""
 
+import pytest
 import torch
 from torch import nn
 
@@ -89,3 +90,61 @@ def test_injection_fails_loudly_for_missing_target():
         assert "No nn.Linear modules matched" in str(error)
     else:
         raise AssertionError("missing target module should raise ValueError")
+    assert all(parameter.requires_grad for parameter in model.parameters())
+
+
+def test_overlapping_saved_module_leaves_model_untouched():
+    model = TinyAttentionModel()
+    with pytest.raises(ValueError, match="overlaps"):
+        inject_s2p_adapter(model, ["q_proj"], r=2, modules_to_save=["encoder"])
+    assert isinstance(model.encoder["q_proj"], nn.Linear)
+    assert all(parameter.requires_grad for parameter in model.parameters())
+
+
+def test_strict_scaling_mismatch_is_rejected_before_factor_changes(tmp_path):
+    model, _ = _prepared_model()
+    model.encoder["q_proj"].switch_to_parallel()
+    path = save_adapter(model, tmp_path / "adapter.pt")
+    target, _ = _prepared_model()
+    layer = target.encoder["q_proj"]
+    layer.scaling = 2
+    before = layer.lora_A.weight.detach().clone()
+    with pytest.raises(RuntimeError, match="Scaling mismatch"):
+        load_adapter(target, path)
+    assert layer.mode == "sequential"
+    torch.testing.assert_close(layer.lora_A.weight, before, rtol=0, atol=0)
+    load_adapter(target, path, strict=False)
+    assert layer.mode == "parallel"
+    assert layer.scaling == 1
+
+
+def test_mixed_phase_merge_changes_no_modules():
+    model = nn.Sequential(nn.Linear(6, 4), nn.Linear(4, 4))
+    inject_s2p_adapter(model, ["0", "1"], r=2)
+    model[0].switch_to_parallel()
+    before = list(model)
+    with pytest.raises(RuntimeError, match="still sequential"):
+        merge_adapters(model)
+    assert list(model) == before
+
+
+def test_safe_merge_rejects_nonfinite_update_before_replacing_any_layer():
+    model = nn.Sequential(nn.Linear(6, 4), nn.Linear(4, 4))
+    inject_s2p_adapter(model, ["0", "1"], r=2)
+    for layer in model:
+        layer.switch_to_parallel()
+    nn.init.constant_(model[1].lora_B.weight, torch.inf)
+    before = list(model)
+    with pytest.raises(ValueError, match="non-finite"):
+        merge_adapters(model, safe_merge=True)
+    assert list(model) == before
+
+
+@pytest.mark.parametrize("width", [4, 6])
+def test_phase_is_preserved_in_raw_model_state(width):
+    layer = S2PLoraLinear(nn.Linear(width, 4), r=2)
+    layer.switch_to_parallel()
+    clone = S2PLoraLinear(nn.Linear(width, 4), r=2)
+    clone.load_state_dict(layer.state_dict())
+    assert clone.mode == "parallel"
+    assert clone.lora_A.weight.shape == (2, width)

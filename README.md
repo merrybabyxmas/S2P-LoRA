@@ -51,7 +51,9 @@ decomposing the full update matrix. The balanced split is
 
 ## Installation
 
-Python 3.10 or newer is required. Commands below start from a clean clone.
+Python 3.10 or newer and PyTorch 2.6 or newer are required. The PyTorch minimum
+also applies when reading the compact `.pt` checkpoint or resuming Trainer state.
+Commands below start from a clean clone.
 
 ```bash
 git clone https://github.com/merrybabyxmas/S2P-LoRA.git
@@ -201,6 +203,50 @@ The 7B configurations require a CUDA GPU with sufficient memory. Reduce
 `--batch-size`, increase `--gradient-accumulation-steps`, or choose a smaller
 backbone when memory is limited. Quantized base layers are not currently
 supported because the public injector targets `torch.nn.Linear` modules.
+
+## Resume training and export LoRA
+
+The trainer currently supports one device. It switches before the first
+training batch after `ceil(switch_ratio * max_steps)` updates and requires at
+least one update in each phase. Evaluation leaves the adapter phase unchanged.
+With nonzero dropout, per-forward output equivalence at the switch applies in
+evaluation mode because the two training phases mask different activations.
+
+Pass `--save-steps N` to either training script to save complete Trainer
+checkpoints. Resume with the original model, data, total steps and switch
+settings, adding `--resume-from-checkpoint PATH/to/trainer/checkpoint-N`.
+`best_adapter.pt` and `final_adapter.pt` contain adapter tensors for loading and
+export. Use the full `checkpoint-N` directory to restore optimizer and RNG state.
+For local GLUE fixtures, supply both `--train-file` and `--validation-file` with
+the task's usual text and `label` columns.
+
+Export a parallel checkpoint to a new directory:
+
+```bash
+s2p-export-peft outputs/.../final_adapter.pt ./lora-adapter
+```
+
+For legacy checkpoints, `--base-model MODEL_ID`, `--task-type CAUSAL_LM` (or
+`SEQ_CLS`), and `--modules-to-save classifier pooler` can supply missing
+metadata. Use the same base model, revision and task head dimensions as in
+training. New training runs record the base model and task automatically.
+
+```python
+from peft import PeftModel
+
+model = PeftModel.from_pretrained(base_model, "./lora-adapter")
+merged_model = model.merge_and_unload(safe_merge=True)
+```
+
+The benchmark entry point compares S2P-LoRA and PEFT LoRA with the same causal
+model, data, rank, seed, and step budget. Install `.[train,dev]` to run both.
+
+```bash
+python scripts/benchmark_adapters.py lora --model Qwen/Qwen2.5-0.5B-Instruct \
+  --output-dir outputs/bench/lora --bf16
+python scripts/benchmark_adapters.py s2p --model Qwen/Qwen2.5-0.5B-Instruct \
+  --output-dir outputs/bench/s2p --bf16
+```
 
 ## Output layout
 

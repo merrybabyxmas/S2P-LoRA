@@ -29,7 +29,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, help="YAML file providing argument defaults")
     parser.add_argument("--model", default="meta-llama/Llama-2-7b-hf")
+    parser.add_argument("--model-revision")
     parser.add_argument("--dataset", default="fxmeng/pissa-dataset")
+    parser.add_argument("--dataset-revision")
     parser.add_argument("--data-file", default="")
     parser.add_argument("--dataset-config", default="")
     parser.add_argument("--dataset-data-dir", default="metamath")
@@ -44,6 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validation-ratio", type=float, default=0.05)
     parser.add_argument("--output-root", type=Path, default=Path("outputs"))
     parser.add_argument("--overwrite-output", action="store_true")
+    parser.add_argument("--save-steps", type=int, default=0)
+    parser.add_argument("--resume-from-checkpoint", type=Path)
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epochs", type=float, default=1.0)
@@ -95,10 +99,12 @@ def main() -> None:
         rank=args.rank,
         switch_ratio=args.switch_ratio,
         seed=args.seed,
-        overwrite=args.overwrite_output,
+        overwrite=args.overwrite_output or args.resume_from_checkpoint is not None,
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model, revision=args.model_revision, use_fast=True
+    )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
@@ -110,7 +116,11 @@ def main() -> None:
             "split": args.train_split,
         }
     else:
-        load_kwargs = {"path": args.dataset, "split": args.train_split}
+        load_kwargs = {
+            "path": args.dataset,
+            "split": args.train_split,
+            "revision": args.dataset_revision,
+        }
         if args.dataset_config:
             load_kwargs["name"] = args.dataset_config
         if args.dataset_data_dir:
@@ -146,6 +156,7 @@ def main() -> None:
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
+        revision=args.model_revision,
         dtype=_dtype(args.precision),
         low_cpu_mem_usage=True,
     )
@@ -162,7 +173,14 @@ def main() -> None:
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
 
-    best_callback = BestAdapterCallback(run_dir, "loss", greater_is_better=False)
+    adapter_metadata = {"task_type": "CAUSAL_LM", "base_model_name_or_path": args.model}
+    if args.model_revision:
+        adapter_metadata["revision"] = (
+            getattr(model.config, "_commit_hash", None) or args.model_revision
+        )
+    best_callback = BestAdapterCallback(
+        run_dir, "loss", greater_is_better=False, adapter_metadata=adapter_metadata
+    )
     use_cuda = torch.cuda.is_available()
     training_args = TrainingArguments(
         output_dir=str(run_dir / "trainer"),
@@ -178,7 +196,8 @@ def main() -> None:
         max_grad_norm=1.0,
         eval_strategy="steps",
         eval_steps=args.eval_steps,
-        save_strategy="no",
+        save_strategy="steps" if args.save_steps else "no",
+        save_steps=args.save_steps or 500,
         logging_strategy="steps",
         logging_steps=args.logging_steps,
         report_to=[],
@@ -208,12 +227,17 @@ def main() -> None:
         "eval_examples": len(encoded["test"]),
     }
     write_json(run_dir / "config.json", manifest)
-    train_result = trainer.train()
+    resume_path = str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None
+    train_result = trainer.train(resume_from_checkpoint=resume_path)
     final_eval = trainer.evaluate()
     save_adapter(
         model,
         run_dir / "final_adapter.pt",
-        metadata={"selection": "final_training_step", "global_step": trainer.state.global_step},
+        metadata={
+            **adapter_metadata,
+            "selection": "final_training_step",
+            "global_step": trainer.state.global_step,
+        },
     )
     write_json(
         run_dir / "metrics.json",

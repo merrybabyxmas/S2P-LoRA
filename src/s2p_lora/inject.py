@@ -63,17 +63,21 @@ def inject_s2p_adapter(
         modules_to_save: Additional module names kept trainable, for example
             ``("classifier", "pooler")`` for sequence classification.
     """
+    if isinstance(target_modules, str) or isinstance(modules_to_save, str):
+        raise TypeError("target_modules and modules_to_save must be sequences of module names")
     targets = {name.strip() for name in target_modules if name.strip()}
     saved = {name.strip() for name in modules_to_save if name.strip()}
     if not targets:
         raise ValueError("target_modules must contain at least one module name")
+    if r <= 0 or not 0.0 <= lora_dropout < 1.0:
+        raise ValueError("r must be positive and lora_dropout must be in [0, 1)")
 
-    for parameter in model.parameters():
-        parameter.requires_grad = False
-
+    named_modules = dict(model.named_modules())
+    if any(isinstance(module, S2PLoraLinear) for module in named_modules.values()):
+        raise ValueError("The model already contains S2P-LoRA adapters")
     candidates = [
         (name, module)
-        for name, module in model.named_modules()
+        for name, module in named_modules.items()
         if name and isinstance(module, nn.Linear) and _matches(name, targets)
     ]
     if not candidates:
@@ -85,42 +89,63 @@ def inject_s2p_adapter(
             f"No nn.Linear modules matched {sorted(targets)}. "
             f"First available linear modules: {preview}"
         )
+    missing_targets = sorted(
+        target for target in targets if not any(_matches(name, {target}) for name, _ in candidates)
+    )
+    if missing_targets:
+        raise ValueError(f"No nn.Linear modules matched target entries {missing_targets}")
 
-    adapted_names: list[str] = []
     for name, linear in candidates:
-        parent_name, _, child_name = name.rpartition(".")
-        parent = model.get_submodule(parent_name) if parent_name else model
-        wrapper = S2PLoraLinear(
-            base_layer=linear,
-            r=r,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-        )
-        wrapper.train(linear.training)
-        setattr(parent, child_name, wrapper)
-        adapted_names.append(name)
+        if r > min(linear.in_features, linear.out_features):
+            raise ValueError(f"r={r} exceeds the smaller dimension of {name}")
+        if not linear.weight.is_floating_point() or linear.weight.device.type == "meta":
+            raise ValueError(f"S2P-LoRA requires a materialized floating-point weight for {name}")
 
-    saved_names: list[str] = []
-    if saved:
-        for name, module in model.named_modules():
-            if name and _matches(name, saved):
-                for parameter in module.parameters():
-                    parameter.requires_grad = True
-                saved_names.append(name)
-        missing = sorted(
-            pattern
-            for pattern in saved
-            if not any(_matches(name, {pattern}) for name in saved_names)
-        )
-        if missing:
-            raise ValueError(f"modules_to_save did not match model modules: {missing}")
+    saved_names = [name for name in named_modules if name and _matches(name, saved)]
+    missing = sorted(
+        pattern for pattern in saved if not any(_matches(name, {pattern}) for name in saved_names)
+    )
+    if missing:
+        raise ValueError(f"modules_to_save did not match model modules: {missing}")
+    saved_roots: list[str] = []
+    for name in sorted(saved_names):
+        if not any(name.startswith(root + ".") for root in saved_roots):
+            saved_roots.append(name)
+    saved_parameters = {
+        parameter for name in saved_roots for parameter in named_modules[name].parameters()
+    }
+    for name, linear in candidates:
+        if any(
+            name == root or name.startswith(root + ".") or root.startswith(name + ".")
+            for root in saved_roots
+        ) or not saved_parameters.isdisjoint(linear.parameters()):
+            raise ValueError(f"modules_to_save overlaps adapted module {name}")
+
+    parameters = list(model.parameters())
+    flags = [parameter.requires_grad for parameter in parameters]
+    wrappers = []
+    try:
+        for name, linear in candidates:
+            wrapper = S2PLoraLinear(linear, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout)
+            wrapper.train(linear.training)
+            wrappers.append((name, wrapper))
+    except Exception:
+        for parameter, flag in zip(parameters, flags, strict=True):
+            parameter.requires_grad_(flag)
+        raise
+    for parameter in parameters:
+        parameter.requires_grad_(parameter in saved_parameters)
+    for name, wrapper in wrappers:
+        parent_name, _, child_name = name.rpartition(".")
+        setattr(named_modules[parent_name], child_name, wrapper)
+    model._s2p_modules_to_save = tuple(saved_roots)
 
     trainable = sum(
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
     )
     total = sum(parameter.numel() for parameter in model.parameters())
     return InjectionReport(
-        adapted_modules=tuple(adapted_names),
+        adapted_modules=tuple(name for name, _ in candidates),
         modules_to_save=tuple(sorted(set(saved_names))),
         trainable_parameters=trainable,
         total_parameters=total,

@@ -321,3 +321,13 @@ def test_bfloat16_nonsquare_switch_forward_and_merge(device):
     ).item()
     assert switch_rel_err < 2e-2
     assert merge_rel_err < 2e-2
+
+
+def test_zero_update_can_learn_after_switch():
+    layer = S2PLoraLinear(torch.nn.Linear(6, 4), r=2)
+    x = torch.ones(1, 6)
+    expected = layer(x).detach()
+    layer.switch_to_parallel()
+    torch.testing.assert_close(layer(x), expected, rtol=0, atol=0)
+    layer(x).sum().backward()
+    assert layer.lora_B.weight.grad.abs().sum() > 0

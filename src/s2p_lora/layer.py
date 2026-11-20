@@ -59,7 +59,10 @@ class S2PLoraLinear(nn.Module):
         self.r = r
         self.scaling = lora_alpha / r
         self.dropout = nn.Dropout(p=lora_dropout) if lora_dropout > 0 else nn.Identity()
-        self.mode = "sequential"
+        self._mode = "sequential"
+        self.register_buffer(
+            "_s2p_parallel", torch.tensor(False, device=base_layer.weight.device)
+        )
 
         d_out, d_in = base_layer.weight.shape
         self.d_out = d_out
@@ -88,13 +91,62 @@ class S2PLoraLinear(nn.Module):
             f"scaling={self.scaling:g}, mode={self.mode!r}"
         )
 
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    def _set_mode(self, mode: str) -> list[tuple[nn.Parameter, nn.Parameter]]:
+        """Select the factor shape before loading or copying weights."""
+        if mode not in ("sequential", "parallel"):
+            raise ValueError(f"Invalid adapter mode: {mode!r}")
+        if mode == self.mode:
+            return []
+
+        width = self.d_in if mode == "parallel" else self.d_out
+        replaced = []
+        if width != self.lora_A.in_features:
+            old = self.lora_A.weight
+            replacement = nn.Linear(width, self.r, bias=False, device=old.device, dtype=old.dtype)
+            replacement.weight.requires_grad_(old.requires_grad)
+            replacement.train(self.training)
+            self.lora_A = replacement
+            replaced.append((old, replacement.weight))
+        self._mode = mode
+        self._s2p_parallel.fill_(mode == "parallel")
+        return replaced
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        phase_key = prefix + "_s2p_parallel"
+        phase = state_dict.get(phase_key)
+        if phase is not None:
+            if phase.shape != () or phase.dtype != torch.bool:
+                error_msgs.append(f"Invalid S2P phase marker for {prefix}")
+                return
+            self._set_mode("parallel" if phase.item() else "sequential")
+        else:
+            # Older raw state dicts identify the phase by shape only on rectangular layers.
+            factor = state_dict.get(prefix + "lora_A.weight")
+            if factor is not None and self.d_in != self.d_out:
+                if factor.shape == (self.r, self.d_in):
+                    self._set_mode("parallel")
+                elif factor.shape == (self.r, self.d_out):
+                    self._set_mode("sequential")
+            state_dict = {**state_dict, phase_key: self._s2p_parallel}
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
+
     # ── Forward ───────────────────────────────────────────────────────────────
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base = self.base_layer(x)
 
         if self.mode == "sequential":
-            adapter_input = F.linear(x, self.base_layer.weight)  # W0 @ x
+            adapter_input = (
+                base if self.base_layer.bias is None else F.linear(x, self.base_layer.weight)
+            )
         else:
             adapter_input = x
 
@@ -120,33 +172,37 @@ class S2PLoraLinear(nn.Module):
         if self.mode == "parallel":
             return []
 
-        is_square = self.d_in == self.d_out
+        return self._apply_parallel_factors(*self._parallel_factors())
+
+    @torch.no_grad()
+    def _parallel_factors(self) -> tuple[torch.Tensor, torch.Tensor]:
         W0 = self.base_layer.weight.detach()  # [d_out, d_in]
         B_s = self.lora_B.weight.detach()  # [d_out, r]
         A_s = self.lora_A.weight.detach()  # [r, d_out]
-        device = W0.device
-        dtype = W0.dtype
-
-        B_s_f = B_s.float()
-        A_s_f = A_s.float()
-        W0_f = W0.float()
+        work_dtype = torch.float64 if W0.dtype == torch.float64 else torch.float32
+        B_s_f = B_s.to(work_dtype)
+        A_s_f = A_s.to(work_dtype)
+        W0_f = W0.to(work_dtype)
         B_p, A_p = core_svd_projection(B_s_f, A_s_f, W0_f)
 
-        self.lora_B.weight.copy_(B_p.to(device=device, dtype=dtype))
+        # A zero column of stored B permits any matching row of A without
+        # changing the represented update. Keep those directions trainable.
+        B_p = B_p.to(self.lora_B.weight.dtype)
+        empty = ~B_p.ne(0).any(dim=0)
+        basis = torch.eye(self.r, self.d_in, device=A_p.device, dtype=A_p.dtype)
+        A_p = torch.where(empty[:, None], basis, A_p).to(self.lora_A.weight.dtype)
+        if not torch.isfinite(A_p).all() or not torch.isfinite(B_p).all():
+            raise ValueError("S2P projection produced non-finite factors")
 
-        replaced: list[tuple[torch.Tensor, torch.Tensor]] = []
+        return B_p, A_p
 
-        if is_square:
-            # In-place: lora_A keeps the same tensor identity
-            self.lora_A.weight.copy_(A_p.to(device=device, dtype=dtype))
-        else:
-            # Shape change r×d_out → r×d_in: must replace module
-            old_weight = self.lora_A.weight
-            new_A = nn.Linear(self.d_in, self.r, bias=False).to(device=device, dtype=dtype)
-            new_A.weight.copy_(A_p.to(device=device, dtype=dtype))
-            new_A.weight.requires_grad_(old_weight.requires_grad)
-            self.lora_A = new_A
-            replaced.append((old_weight, new_A.weight))
+    @torch.no_grad()
+    def _apply_parallel_factors(
+        self, B_p: torch.Tensor, A_p: torch.Tensor
+    ) -> list[tuple[nn.Parameter, nn.Parameter]]:
+        replaced = self._set_mode("parallel")
+        self.lora_B.weight.copy_(B_p)
+        self.lora_A.weight.copy_(A_p)
 
         # Clear stale gradients
         if self.lora_A.weight.grad is not None:
@@ -154,13 +210,12 @@ class S2PLoraLinear(nn.Module):
         if self.lora_B.weight.grad is not None:
             self.lora_B.weight.grad = None
 
-        self.mode = "parallel"
         return replaced
 
     # ── Merge into base weight (for inference) ─────────────────────────────────
 
     @torch.no_grad()
-    def merge(self) -> nn.Linear:
+    def merge(self, *, safe_merge: bool = True) -> nn.Linear:
         """
         Merge parallel lora_B @ lora_A into base weight.
         Only valid after switching to parallel mode.
@@ -170,16 +225,26 @@ class S2PLoraLinear(nn.Module):
             raise RuntimeError("merge() requires parallel mode; call switch_to_parallel() first.")
         device = self.base_layer.weight.device
         dtype = self.base_layer.weight.dtype
-        W_merged = self.base_layer.weight.detach() + (
-            self.lora_B.weight.detach() @ self.lora_A.weight.detach() * self.scaling
+        work_dtype = torch.float64 if dtype == torch.float64 else torch.float32
+        W_merged = self.base_layer.weight.detach().to(work_dtype) + (
+            self.lora_B.weight.detach().to(work_dtype)
+            @ self.lora_A.weight.detach().to(work_dtype)
+            * self.scaling
         )
+        W_merged = W_merged.to(dtype)
+        if safe_merge and not torch.isfinite(W_merged).all():
+            raise ValueError("Cannot merge non-finite S2P-LoRA weights")
         merged = nn.Linear(
             self.d_in,
             self.d_out,
             bias=self.base_layer.bias is not None,
-        ).to(device=device, dtype=dtype)
-        merged.weight.copy_(W_merged.to(device=device, dtype=dtype))
+            device=device,
+            dtype=dtype,
+        )
+        merged.weight.copy_(W_merged)
+        merged.weight.requires_grad_(self.base_layer.weight.requires_grad)
         if self.base_layer.bias is not None:
-            merged.bias.copy_(self.base_layer.bias.detach().to(device=device, dtype=dtype))
+            merged.bias.copy_(self.base_layer.bias)
+            merged.bias.requires_grad_(self.base_layer.bias.requires_grad)
         merged.train(self.base_layer.training)
         return merged

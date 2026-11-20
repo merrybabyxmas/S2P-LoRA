@@ -1,23 +1,33 @@
-"""Hugging Face Trainer integration for S2P-LoRA.
-
-``switch_ratio`` denotes normalized training progress in ``(0, 1)``.
-The trainer uses ``global_step / max_steps`` when available, so its meaning is
-identical for epoch- and step-based training.
-
-At the switch, the function-preserving projection converts every compatible
-layer from ``(B_s, A_s)`` to ``(B_p, A_p)`` while preserving
-``B_p A_p = B_s A_s W0``. Optimizer states are reset after switching. For
-non-square weights, ``lora_A`` changes shape and its parameter reference is
-replaced in the optimizer automatically.
-"""
+"""Training-step scheduling for the standalone S2P-LoRA implementation."""
 
 from __future__ import annotations
 
-from transformers import Trainer
+import json
+import math
+from pathlib import Path
+
+from transformers import Trainer, TrainerCallback
+
+from .layer import S2PLoraLinear
+from .run_utils import write_json
+
+_TRAINING_STATE = "s2p_training_state.json"
+
+
+class _SwitchCallback(TrainerCallback):
+    def __init__(self, trainer: S2PLoraTrainer) -> None:
+        self.trainer = trainer
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.trainer._initialize_schedule(state)
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        if not self.trainer.has_switched and state.global_step >= self.trainer.switch_step:
+            self.trainer._execute_switch(state.global_step / state.max_steps)
 
 
 class S2PLoraTrainer(Trainer):
-    """HuggingFace Trainer with S2P-LoRA sequential→parallel switching."""
+    """Train sequentially for ceil(switch_ratio * max_steps) Trainer steps."""
 
     def __init__(
         self,
@@ -26,133 +36,124 @@ class S2PLoraTrainer(Trainer):
         momentum_reset: bool = True,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
-
         self.switch_ratio = float(switch_ratio)
         if not 0.0 < self.switch_ratio < 1.0:
             raise ValueError("switch_ratio must be in (0, 1) for sequential-to-parallel training")
-
+        super().__init__(*args, **kwargs)
         self.momentum_reset = momentum_reset
         self.has_switched = False
-        self.s2p_layers: list = []
-
-        self.loss_track: dict[str, float] = {}
+        self.switch_step = 0
+        self._restored_schedule: dict | None = None
+        self.s2p_layers: list[S2PLoraLinear] = []
         self.switch_events: list[dict[str, object]] = []
-        self.mode_initialized = False
-
-    # ── Layer discovery and initial mode ─────────────────────────────────────────
+        self.add_callback(_SwitchCallback(self))
 
     def _ensure_layers_cached(self) -> None:
-        if self.s2p_layers:
-            return
-
-        for module in self.model.modules():
-            has_switch = callable(getattr(module, "switch_to_parallel", None))
-            if has_switch:
-                self.s2p_layers.append(module)
-
         if not self.s2p_layers:
-            raise RuntimeError(
-                "S2PLoraTrainer found no compatible S2P-LoRA layers. "
-                "Wrap target nn.Linear modules with S2PLoraLinear before training."
-            )
+            self.s2p_layers = [
+                module for module in self.model.modules() if isinstance(module, S2PLoraLinear)
+            ]
+        if not self.s2p_layers:
+            raise RuntimeError("S2PLoraTrainer found no compatible S2P-LoRA layers")
 
-    def _validate_initial_mode(self) -> None:
+    def _initialize_schedule(self, state) -> None:
+        if (
+            self.args.world_size != 1
+            or self.args.n_gpu > 1
+            or self.args.torch_compile
+            or self.is_deepspeed_enabled
+            or self.is_fsdp_enabled
+        ):
+            raise ValueError("S2PLoraTrainer requires one device without sharding or torch.compile")
+        self.s2p_layers.clear()
         self._ensure_layers_cached()
-        if any(getattr(layer, "mode", None) != "sequential" for layer in self.s2p_layers):
+        self.switch_step = math.ceil(self.switch_ratio * state.max_steps)
+        if not 0 < self.switch_step < state.max_steps:
+            raise ValueError("The schedule must reserve at least one training step for each phase")
+        if self._restored_schedule is not None:
+            previous = self._restored_schedule
+            if (
+                previous["max_steps"] != state.max_steps
+                or previous["switch_step"] != self.switch_step
+                or previous["momentum_reset"] != self.momentum_reset
+            ):
+                raise ValueError("Resume S2P-LoRA with the original training and switch schedule")
+            self.switch_events = list(previous["switch_events"])
+            self._restored_schedule = None
+
+        expected = "parallel" if state.global_step > self.switch_step else "sequential"
+        if any(layer.mode != expected for layer in self.s2p_layers):
             raise RuntimeError(
-                "S2PLoraTrainer requires every adapter to start in sequential mode. "
-                "Create adapters with inject_s2p_adapter before training."
+                f"Checkpoint adapter phase does not match the schedule at step "
+                f"{state.global_step}; expected {expected}. Resume with the original schedule."
             )
+        self.has_switched = expected == "parallel"
 
-    def _current_progress(self) -> float:
-        max_steps = int(getattr(self.state, "max_steps", 0) or 0)
-        if max_steps > 0:
-            progress = float(self.state.global_step) / max_steps
-        else:
-            total_epochs = float(getattr(self.args, "num_train_epochs", 0.0) or 0.0)
-            progress = float(self.state.epoch or 0.0) / max(total_epochs, 1.0)
-        return min(max(progress, 0.0), 1.0)
-
-    # ── Switch and optimizer lifecycle ───────────────────────────────────────────────
-
-    def _switch_layer(self, layer) -> list:
-        """Project one layer to parallel mode and return replaced parameters."""
-        return layer.switch_to_parallel()
-
-    def _update_optimizer_for_replaced_params(self, replaced_params: list) -> None:
-        """Replace shape-changing ``lora_A`` parameters in optimizer groups."""
-        if not replaced_params or self.optimizer is None:
-            return
-
-        for old_param, new_param in replaced_params:
-            found = False
-            for group in self.optimizer.param_groups:
-                for index, param in enumerate(group["params"]):
-                    if param is old_param:
-                        group["params"][index] = new_param
-                        found = True
-            self.optimizer.state.pop(old_param, None)
-            if old_param.requires_grad and not found:
-                raise RuntimeError(
-                    "A replaced trainable lora_A parameter was not present in "
-                    "optimizer.param_groups."
-                )
-
-    def _execute_switch(self, model, progress: float) -> None:
-        """Switch all cached layers to parallel and reset optimizer state."""
-        replaced = []
+    def _execute_switch(self, progress: float) -> None:
+        # Compute all projections before updating a factor or an optimizer group.
+        optimizer = self.optimizer
+        locations = {}
+        for group in optimizer.param_groups:
+            for index, parameter in enumerate(group["params"]):
+                locations[parameter] = (group["params"], index)
         for layer in self.s2p_layers:
-            replaced.extend(self._switch_layer(layer))
+            for parameter in (layer.lora_A.weight, layer.lora_B.weight):
+                if parameter.requires_grad and parameter not in locations:
+                    raise RuntimeError("A trainable S2P-LoRA factor is missing from the optimizer")
 
-        self._update_optimizer_for_replaced_params(replaced)
-
-        if self.optimizer is not None and self.momentum_reset:
-            reset_count = 0
-            for name, param in model.named_parameters():
-                if (
-                    param.requires_grad
-                    and ("s2p" in name or "lora" in name)
-                    and param in self.optimizer.state
-                ):
-                    self.optimizer.state[param] = {}
-                    reset_count += 1
-            print(f">>> [RESET] {reset_count} optimizer states cleared.")
+        factors = [layer._parallel_factors() for layer in self.s2p_layers]
+        for layer, (b_parallel, a_parallel) in zip(self.s2p_layers, factors, strict=True):
+            for old, new in layer._apply_parallel_factors(b_parallel, a_parallel):
+                if old in locations:
+                    group, index = locations[old]
+                    group[index] = new
+                optimizer.state.pop(old, None)
+            if self.momentum_reset:
+                optimizer.state.pop(layer.lora_A.weight, None)
+                optimizer.state.pop(layer.lora_B.weight, None)
 
         self.has_switched = True
         self.switch_events.append(
-            {"progress": progress, "scope": "all", "layers": len(self.s2p_layers)}
+            {"step": self.state.global_step, "progress": progress, "layers": len(self.s2p_layers)}
         )
-        print(f">>> [SWITCH] Progress {progress:.3f}: ALL layers Sequential → Parallel")
 
-    # ── Training step ─────────────────────────────────────────────────────────────
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        # A user-provided optimizer may exist before raw model loading resizes A.
+        target = self.model if model is None else model
+        optimizer = self.optimizer
+        before = dict(target.named_parameters()) if optimizer is not None else {}
+        schedule_path = Path(resume_from_checkpoint) / _TRAINING_STATE
+        self._restored_schedule = None
+        if schedule_path.is_file():
+            self._restored_schedule = json.loads(schedule_path.read_text(encoding="utf-8"))
+        super()._load_from_checkpoint(resume_from_checkpoint, model)
+        if optimizer is not None:
+            replaced = {
+                before[name]: parameter
+                for name, parameter in target.named_parameters()
+                if parameter is not before[name]
+            }
+            for group in optimizer.param_groups:
+                group["params"][:] = [
+                    replaced.get(parameter, parameter) for parameter in group["params"]
+                ]
+            for old in replaced:
+                optimizer.state.pop(old, None)
 
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        self._ensure_layers_cached()
-
-        if not self.mode_initialized:
-            self._validate_initial_mode()
-            self.mode_initialized = True
-
-        if not self.has_switched:
-            progress = self._current_progress()
-            if progress >= self.switch_ratio:
-                self._execute_switch(model, progress)
-
-        outputs = model(**inputs)
-        loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-
-        parallel_fraction = sum(
-            getattr(layer, "mode", None) == "parallel" for layer in self.s2p_layers
-        ) / len(self.s2p_layers)
-        self.loss_track = {
-            "task_loss": loss.detach().mean().item(),
-            "adapter_mode": float(parallel_fraction),
-        }
-
-        return (loss, outputs) if return_outputs else loss
+    def _save(self, output_dir=None, state_dict=None):
+        super()._save(output_dir, state_dict)
+        if self.switch_step:
+            write_json(
+                Path(output_dir or self.args.output_dir) / _TRAINING_STATE,
+                {
+                    "max_steps": self.state.max_steps,
+                    "switch_step": self.switch_step,
+                    "momentum_reset": self.momentum_reset,
+                    "switch_events": self.switch_events,
+                },
+            )
 
     def log(self, logs: dict[str, float], *args, **kwargs) -> None:
-        if self.model.training and self.loss_track:
-            logs.update(self.loss_track)
+        if self.model.training and self.s2p_layers:
+            logs.setdefault("adapter_mode", float(self.has_switched))
         super().log(logs, *args, **kwargs)
